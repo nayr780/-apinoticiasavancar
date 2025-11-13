@@ -545,7 +545,12 @@ def _start():
         _refresher_thread.start()
 
 if __name__ == "__main__":
+    import os
+
     print("🔧 Iniciando API, construindo primeiro snapshot...")
     _start()
-    print("🚀 API pronta em: http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+
+    port = int(os.environ.get("PORT", 5000))  # porta que o Render fornece
+    print(f"🚀 API pronta em: 0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
