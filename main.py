@@ -1,32 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-API de notícias (snapshot horário) — só newspaper3k
+API de notícias (snapshot horário) — newspaper3k + debug forte
 - Atualiza a cada 1 hora
-- Extrai conteúdo apenas com newspaper3k; se falhar, descarta o artigo
+- Extrai conteúdo apenas com newspaper3k (se falhar, descarta)
 - CORS aberto (Access-Control-Allow-Origin: *)
 - Rate limit + mitigação simples de DDoS
-Executar: python apinoticias.py
-Endpoints:
-  - http://127.0.0.1:5000/api/v1/news
-  - http://127.0.0.1:5000/api/v1/status
+- Observabilidade:
+    * Logs detalhados no console
+    * Buffer em memória: GET /api/v1/logs (últimos ~2000 eventos)
+    * Payload inclui estatísticas e "descartados" com motivo e debug
+
+Executar local:  python main.py
+No Render: porta lida de os.environ["PORT"]
 """
 from __future__ import annotations
 from flask import Flask, request, jsonify, make_response, abort
-import feedparser, re, html, calendar, hashlib, threading, time, os
+import feedparser, re, html, calendar, hashlib, threading, time, os, sys
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime, format_datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 
 # --- extrator único (newspaper3k) ---
 try:
     from newspaper import Article as _NPArticle
     _HAS_NEWSPAPER = True
-except Exception:
+except Exception as e:
     _HAS_NEWSPAPER = False
+    _NEWSPAPER_IMPORT_ERR = f"Falha import newspaper3k: {e!r}"
 
 # --------------------------------- Config ---------------------------------
 TZ = ZoneInfo("America/Fortaleza")
@@ -48,7 +52,7 @@ ALL_FEEDS = [
     "https://www.convergenciadigital.com.br/feed/",
 ]
 
-REFRESH_INTERVAL = timedelta(hours=1)      # <- 1h cravado
+REFRESH_INTERVAL = timedelta(hours=1)      # 1h fixo
 
 # Rate limit / mitigação
 RATE_LIMIT_PER_MIN = 60
@@ -60,10 +64,20 @@ BAN_TIME_SECONDS = 15 * 60
 MAX_CONTENT_LENGTH = 32 * 1024
 ALLOWED_METHODS = {"GET", "HEAD", "OPTIONS"}
 
-# Conteúdo
-CONTENT_TIMEOUT = 8           # timeout por artigo
+# Conteúdo / network
+CONTENT_TIMEOUT = 10          # timeout por artigo (s)
 CONTENT_MAX_CHARS = 8000      # máximo retornado
 _UA_ARTICLE = "Mozilla/5.0 (ContentFetcher; +https://example.local)"
+
+# Debug / observabilidade
+DEBUG_VERBOSE = True
+_LOGBUF = deque(maxlen=2000)
+
+def _log(msg: str):
+    ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    _LOGBUF.append(line)
+    print(line, flush=True)
 
 # --------------------------------- App ---------------------------------
 app = Flask(__name__)
@@ -86,8 +100,7 @@ def _ddos_and_ratelimit_guard():
         abort(405)
     ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
     now = _now_ts()
-    # log simples
-    print(f"➡ {request.method} {request.path} from {ip} Origin={request.headers.get('Origin')!r}")
+    _log(f"➡ {request.method} {request.path} from {ip} Origin={request.headers.get('Origin')!r}")
     with _rate_lock:
         st = _rate_state.get(ip)
         if not st:
@@ -120,7 +133,7 @@ def _add_cors_and_log(resp):
         clen = resp.calculate_content_length()
     except Exception:
         clen = -1
-    print(f"⬅ {resp.status} {request.method} {request.path} len={clen} ETag={resp.headers.get('ETag')} Cache={resp.headers.get('Cache-Control')}")
+    _log(f"⬅ {resp.status} {request.method} {request.path} len={clen} ETag={resp.headers.get('ETag')} Cache={resp.headers.get('Cache-Control')}")
     return resp
 
 # ----------------------------- Helpers limpeza -----------------------------
@@ -195,54 +208,9 @@ def _absolutize(url, base):
 def _is_tiny_icon(url):
     return bool(re.search(r'(\b|_)(16|24|32|48|64|96)x\1?(16|24|32|48|64|96)\b', url or "", re.I))
 
-def _first_image_in_content(entry, resumo_raw):
-    contents = entry.get("content") or []
-    for c in contents:
-        val = c.get("value") if isinstance(c, dict) else getattr(c, "value", None)
-        if val:
-            m = _img_re.search(val)
-            if m:
-                return m.group(1)
-    raw_ce = entry.get("content:encoded") or ""
-    if raw_ce:
-        m = _img_re.search(raw_ce)
-        if m:
-            return m.group(1)
-    m = _img_re.search(resumo_raw or "")
-    return m.group(1) if m else None
-
-def _first_href_in_content(entry, base_link):
-    contents = entry.get("content") or []
-    for c in contents:
-        val = c.get("value") if isinstance(c, dict) else getattr(c, "value", None)
-        if val:
-            m = _href_re.search(val)
-            if m:
-                return _absolutize(m.group(1), base_link)
-    raw_ce = entry.get("content:encoded") or ""
-    if raw_ce:
-        m = _href_re.search(raw_ce)
-        if m:
-            return _absolutize(m.group(1), base_link)
-    resumo_raw = entry.get("summary") or entry.get("description") or ""
-    m = _href_re.search(resumo_raw)
-    if m:
-        return _absolutize(m.group(1), base_link)
-    return None
-
-def _favicon_from(link: str) -> str:
-    try:
-        u = urlparse(link or "")
-        base = f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else ""
-        return urljoin(base, "/favicon.ico") if base else None
-    except Exception:
-        return None
-
 # --- pega og:image / twitter:image da página ---
 _session = requests.Session()
-_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (RSS Preview Bot; +https://example.local) Python/requests"
-})
+_session.headers.update({"User-Agent": "Mozilla/5.0 (RSS Preview Bot; +https://example.local) Python/requests"})
 
 def get_page_image(article_url: str) -> str | None:
     try:
@@ -256,24 +224,6 @@ def get_page_image(article_url: str) -> str | None:
         tw = soup.find("meta", attrs={"name": "twitter:image"}) or soup.find("meta", property="twitter:image")
         if tw and tw.get("content"):
             return _absolutize(tw["content"].strip(), article_url)
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                import json
-                data = json.loads(script.string or "")
-                imgs = []
-                if isinstance(data, dict):
-                    imgs = data.get("image") or []
-                elif isinstance(data, list):
-                    for it in data:
-                        if isinstance(it, dict) and it.get("@type") in ("NewsArticle", "Article"):
-                            imgs = it.get("image") or []
-                            break
-                if isinstance(imgs, str):
-                    return _absolutize(imgs, article_url)
-                if isinstance(imgs, list) and imgs:
-                    return _absolutize(imgs[0], article_url)
-            except Exception:
-                pass
     except Exception:
         return None
     return None
@@ -282,8 +232,7 @@ def extract_image(entry, resumo_raw, link, channel_image_url=None):
     base = link or (entry.get("link") if isinstance(entry, dict) else "") or ""
     thumbs = entry.get("media_thumbnail") or entry.get("media_thumbnails") or []
     if thumbs:
-        url = (thumbs[0].get("url") if isinstance(thumbs[0], dict)
-               else getattr(thumbs[0], "url", None))
+        url = (thumbs[0].get("url") if isinstance(thumbs[0], dict) else getattr(thumbs[0], "url", None))
         if url:
             url = _absolutize(url, base)
             if url and not _is_tiny_icon(url):
@@ -303,7 +252,17 @@ def extract_image(entry, resumo_raw, link, channel_image_url=None):
             href = _absolutize(href, base)
             if href and not _is_tiny_icon(href):
                 return href
-    inline = _first_image_in_content(entry, resumo_raw)
+    inline = None
+    contents = entry.get("content") or []
+    for c in contents:
+        val = c.get("value") if isinstance(c, dict) else getattr(c, "value", None)
+        if val:
+            m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', val or "", re.I)
+            if m:
+                inline = m.group(1); break
+    if not inline and resumo_raw:
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', resumo_raw or "", re.I)
+        inline = m.group(1) if m else None
     if inline:
         inline = _absolutize(inline, base)
         if inline and not _is_tiny_icon(inline):
@@ -312,15 +271,12 @@ def extract_image(entry, resumo_raw, link, channel_image_url=None):
         ogimg = get_page_image(link)
         if ogimg and not _is_tiny_icon(ogimg):
             return ogimg
-    try:
-        host = urlparse(base).netloc
-    except Exception:
-        host = ""
-    if "fecomercio.com.br" in host and channel_image_url:
-        return _absolutize(channel_image_url, base)
     if channel_image_url and not _is_tiny_icon(channel_image_url):
         return _absolutize(channel_image_url, base)
-    return _favicon_from(base)
+    try:
+        return urljoin(base, "/favicon.ico")
+    except Exception:
+        return None
 
 # ---------------------- Conteúdo (apenas newspaper3k) ----------------------
 def _clean_text_spaces(txt: str) -> str:
@@ -335,38 +291,82 @@ def _truncate(txt: str, limit: int) -> tuple[str, bool]:
         return txt, False
     return txt[:limit], True
 
+def _preflight(url: str) -> dict:
+    """Faz um HEAD/GET rápido só para debug (status, tipo, tamanho)."""
+    info = {"ok": False, "status": None, "ctype": None, "clen": None, "via": "HEAD"}
+    try:
+        r = _session.head(url, timeout=5, allow_redirects=True,
+                          headers={"User-Agent": _UA_ARTICLE})
+        info["status"] = r.status_code
+        info["ctype"] = r.headers.get("Content-Type")
+        info["clen"] = r.headers.get("Content-Length")
+        info["ok"] = (200 <= r.status_code < 400)
+    except Exception as e:
+        info["via"] = "GET"
+        try:
+            r = _session.get(url, timeout=5, allow_redirects=True,
+                             headers={"User-Agent": _UA_ARTICLE})
+            info["status"] = r.status_code
+            info["ctype"] = r.headers.get("Content-Type")
+            info["clen"] = r.headers.get("Content-Length")
+            info["ok"] = (200 <= r.status_code < 400)
+        except Exception as e2:
+            info["error"] = f"preflight err: {e!r} | {e2!r}"
+    return info
+
 def fetch_article_content_newspaper(url: str) -> dict | None:
     """
     Extrai conteúdo com newspaper3k. Se não conseguir, retorna None.
+    Loga cada etapa para debug.
     """
     if not _HAS_NEWSPAPER:
+        _log(f"📰 [{url}] newspaper3k indisponível ({_NEWSPAPER_IMPORT_ERR if '_NEWSPAPER_IMPORT_ERR' in globals() else 'não instalado'})")
         return None
+    t0 = time.time()
+    _log(f"📰 [{url}] preflight...")
+    pf = _preflight(url)
+    _log(f"📰 [{url}] preflight => {pf}")
     try:
+        _log(f"📰 [{url}] newspaper.download()...")
         art = _NPArticle(url, language="pt")
         art.download()
+        _log(f"📰 [{url}] download_state={getattr(art, 'download_state', None)} len_html={len(getattr(art, 'html', '') or '')}")
+        _log(f"📰 [{url}] newspaper.parse()...")
         art.parse()
         txt = _clean_text_spaces(getattr(art, "text", "") or "")
+        _log(f"📰 [{url}] parse OK, chars={len(txt)}")
         if not txt:
+            _log(f"📰 [{url}] texto vazio — descartando")
             return None
         txt, trunc = _truncate(txt, CONTENT_MAX_CHARS)
-        return {"texto": txt, "truncado": trunc}
-    except Exception:
+        dt = time.time() - t0
+        _log(f"📰 [{url}] SUCESSO newspaper3k em {dt:.2f}s (truncado={trunc})")
+        return {"texto": txt, "truncado": trunc, "debug": {"preflight": pf, "elapsed": dt}}
+    except Exception as e:
+        dt = time.time() - t0
+        _log(f"📰 [{url}] ERRO newspaper: {e!r} em {dt:.2f}s")
         return None
 
 # ----------------------------- Coleta & Contagem -----------------------------
 def coletar_artigos():
-    artigos = []
-    print("⏳ Iniciando coleta de feeds...")
+    artigos_ok = []
+    descartados = []  # [{titulo, link, fonte, motivo, debug}]
+    stats_por_feed = []
+    total_rss_items = 0
+
+    _log("⏳ Iniciando coleta de feeds...")
     for url in ALL_FEEDS:
         inicio = time.time()
-        print(f"→ Lendo {url}")
+        _log(f"→ Lendo feed {url}")
         try:
             feed = feedparser.parse(url)
             elapsed = time.time() - inicio
             qtd = len(feed.entries)
-            print(f"   ✅ {url} carregado em {elapsed:.1f}s com {qtd} itens")
+            src_title = clean_source(feed.feed.get("title", url))
+            stats_por_feed.append({"feed": url, "fonte": src_title, "itens": qtd, "elapsed_s": round(elapsed, 2)})
+            total_rss_items += qtd
+            _log(f"   ✅ {url} carregado em {elapsed:.1f}s com {qtd} itens | fonte='{src_title}'")
 
-            fonte = clean_source(feed.feed.get("title", url))
             channel_img = None
             imgobj = feed.feed.get("image")
             if isinstance(imgobj, dict):
@@ -377,44 +377,67 @@ def coletar_artigos():
                 channel_img = feed.feed.get("image_url") or feed.feed.get("image_href")
 
             for e in feed.entries:
-                titulo = clean_title(e.get("title"))
-                link = (e.get("link") or "").strip()
-                resumo_raw = e.get("summary") or e.get("description") or ""
-                imagem = extract_image(e, resumo_raw, link, channel_image_url=channel_img)
-                resumo, leia_mais = clean_summary(resumo_raw)
-
                 try:
-                    host = urlparse(link).netloc
-                except Exception:
-                    host = ""
+                    titulo = clean_title(e.get("title"))
+                    link = (e.get("link") or "").strip()
+                    resumo_raw = e.get("summary") or e.get("description") or ""
+                    imagem = extract_image(e, resumo_raw, link, channel_image_url=channel_img)
+                    resumo, leia_mais = clean_summary(resumo_raw)
+                    dt, shown = parse_datetime(e)
 
-                # conteúdo com newspaper; se não vier, NÃO adiciona artigo
-                conteudo_info = fetch_article_content_newspaper(link) if link else None
-                if not conteudo_info or not conteudo_info.get("texto"):
-                    continue  # descarta artigo sem conteúdo
+                    if not link:
+                        descartados.append({
+                            "titulo": titulo, "link": link, "fonte": src_title,
+                            "motivo": "sem link", "debug": {}
+                        })
+                        _log(f"   • DESCARTADO (sem link): {titulo}")
+                        continue
 
-                dt, shown = parse_datetime(e)
+                    _log(f"   • Artigo RSS: '{titulo}' | {link}")
+                    conteudo_info = fetch_article_content_newspaper(link)
 
-                artigos.append({
-                    "titulo": titulo,
-                    "link": link,
-                    "resumo": resumo,
-                    "leia_mais": leia_mais,
-                    "fonte": fonte,
-                    "publicado": shown,
-                    "imagem": imagem,
-                    "ts": dt.timestamp(),
-                    "conteudo": conteudo_info["texto"],
-                    "conteudo_len": len(conteudo_info["texto"]),
-                    "conteudo_truncado": bool(conteudo_info["truncado"]),
-                    "conteudo_source": "newspaper",
-                })
+                    if not conteudo_info or not conteudo_info.get("texto"):
+                        descartados.append({
+                            "titulo": titulo, "link": link, "fonte": src_title,
+                            "motivo": "conteudo vazio/erro newspaper", "debug": conteudo_info.get("debug") if conteudo_info else {}
+                        })
+                        _log(f"     → DESCARTADO (sem conteúdo): {link}")
+                        continue
 
-        except Exception as ex:
-            print(f"❌ Erro no feed {url}: {ex}")
-    print(f"🏁 Coleta concluída: {len(artigos)} artigos no total (apenas com conteúdo)")
-    artigos.sort(key=lambda x: x["ts"], reverse=True)
-    return artigos
+                    artigo = {
+                        "titulo": titulo,
+                        "link": link,
+                        "resumo": resumo,
+                        "leia_mais": leia_mais,
+                        "fonte": src_title,
+                        "publicado": shown,
+                        "imagem": imagem,
+                        "ts": dt.timestamp(),
+                        "conteudo": conteudo_info["texto"],
+                        "conteudo_len": len(conteudo_info["texto"]),
+                        "conteudo_truncado": bool(conteudo_info.get("truncado")),
+                        "conteudo_source": "newspaper",
+                        "conteudo_debug": conteudo_info.get("debug"),
+                    }
+                    artigos_ok.append(artigo)
+                    _log(f"     → OK ({src_title}) '{titulo}' chars={artigo['conteudo_len']}")
+
+                except Exception as ex_item:
+                    descartados.append({
+                        "titulo": clean_title(e.get("title")),
+                        "link": (e.get("link") or "").strip(),
+                        "fonte": src_title,
+                        "motivo": f"excecao item: {repr(ex_item)[:160]}",
+                        "debug": {}
+                    })
+                    _log(f"   • ERRO item: {ex_item!r}")
+
+        except Exception as ex_feed:
+            _log(f"❌ Erro no feed {url}: {ex_feed!r}")
+
+    _log(f"🏁 Coleta concluída: {len(artigos_ok)} artigos OK / {len(descartados)} descartados / {total_rss_items} itens RSS")
+    artigos_ok.sort(key=lambda x: x["ts"], reverse=True)
+    return artigos_ok, descartados, stats_por_feed, total_rss_items
 
 def contar_por_fonte(artigos):
     cont = Counter(a["fonte"] for a in artigos)
@@ -427,35 +450,40 @@ _snapshot_lock = threading.Lock()
 _snapshot = {"data": None, "built_at": None, "next_build_at": None, "etag": None}
 
 def _build_snapshot():
-    artigos = coletar_artigos()
-    contagens, total = contar_por_fonte(artigos)
+    artigos, descartados, stats_por_feed, total_rss_items = coletar_artigos()
+    contagens, total_ok = contar_por_fonte(artigos)
     built_at = datetime.now(TZ).replace(microsecond=0)
-    # agenda próxima virando pra próxima hora + 1h
     next_build_at = (built_at.replace(minute=0, second=0) + REFRESH_INTERVAL)
+
     payload = {
         "generated_at": built_at.isoformat(),
         "next_refresh_at": next_build_at.isoformat(),
-        "total": total,
-        "por_fonte": contagens,
-        "artigos": artigos,
+        "total_ok": total_ok,
+        "total_rss_items": total_rss_items,
+        "por_fonte_ok": contagens,
+        "feeds_stats": stats_por_feed,
+        "artigos": artigos,             # só os com conteúdo
+        "descartados": descartados,     # com motivo e (quando houver) debug
     }
-    etag_src = (str(total) + built_at.isoformat()).encode("utf-8")
+    etag_src = (str(total_ok) + built_at.isoformat()).encode("utf-8")
     etag = hashlib.sha256(etag_src).hexdigest()[:16]
+
     with _snapshot_lock:
         _snapshot["data"] = payload
         _snapshot["built_at"] = built_at
         _snapshot["next_build_at"] = next_build_at
         _snapshot["etag"] = etag
-    print(f"✅ Snapshot reconstruído às {built_at.isoformat()} (próximo às {next_build_at.isoformat()})")
+
+    _log(f"✅ Snapshot reconstruído às {built_at.isoformat()} (próximo às {next_build_at.isoformat()}); OK={total_ok} RSS={total_rss_items} DESC={len(descartados)}")
 
 def _ensure_first_snapshot():
-    print("🛠 Garantindo que o primeiro snapshot exista...")
+    _log("🛠 Garantindo que o primeiro snapshot exista...")
     with _snapshot_lock:
         need = _snapshot["data"] is None
     if need:
         _build_snapshot()
     else:
-        print("✅ Snapshot já existente, pulando rebuild.")
+        _log("✅ Snapshot já existente, pulando rebuild.")
 
 def _background_refresher(stop_evt: threading.Event):
     while not stop_evt.is_set():
@@ -466,7 +494,7 @@ def _background_refresher(stop_evt: threading.Event):
             if nxt is None or now >= nxt:
                 _build_snapshot()
         except Exception as e:
-            print("Erro no refresher:", e)
+            _log(f"Erro no refresher: {e!r}")
         stop_evt.wait(15)
 
 _stop_event = threading.Event()
@@ -483,16 +511,9 @@ def _with_http_cache_headers(resp, built_at: datetime, etag: str):
 
 @app.get("/api/v1/news")
 def api_news():
-    """
-    Entrega o snapshot mais recente (NÃO reconstrói on-demand).
-    Suporta ETag/If-None-Match e If-Modified-Since -> 304 Not Modified.
-    """
     _ensure_first_snapshot()
     with _snapshot_lock:
-        data = _snapshot["data"]
-        built_at = _snapshot["built_at"]
-        etag = _snapshot["etag"]
-
+        data = _snapshot["data"]; built_at = _snapshot["built_at"]; etag = _snapshot["etag"]
     inm = request.headers.get("If-None-Match")
     ims = request.headers.get("If-Modified-Since")
     if inm and inm == etag:
@@ -500,13 +521,11 @@ def api_news():
     if ims:
         try:
             ims_dt = parsedate_to_datetime(ims)
-            if ims_dt.tzinfo is None:
-                ims_dt = ims_dt.replace(tzinfo=timezone.utc)
+            if ims_dt.tzinfo is None: ims_dt = ims_dt.replace(tzinfo=timezone.utc)
             if built_at <= ims_dt.astimezone(TZ):
                 return _with_http_cache_headers(make_response(("", 304)), built_at, etag)
         except Exception:
             pass
-
     resp = make_response(jsonify(data), 200)
     return _with_http_cache_headers(resp, built_at, etag)
 
@@ -514,9 +533,7 @@ def api_news():
 def api_status():
     _ensure_first_snapshot()
     with _snapshot_lock:
-        built_at = _snapshot["built_at"]
-        next_build_at = _snapshot["next_build_at"]
-        etag = _snapshot["etag"]
+        built_at = _snapshot["built_at"]; next_build_at = _snapshot["next_build_at"]; etag = _snapshot["etag"]
     return {
         "service": "news-snapshot",
         "timezone": str(TZ),
@@ -526,7 +543,13 @@ def api_status():
         "rate_limit_per_min": RATE_LIMIT_PER_MIN,
         "burst": RATE_LIMIT_BURST,
         "ban_time_seconds": BAN_TIME_SECONDS,
+        "newspaper_available": _HAS_NEWSPAPER,
     }
+
+@app.get("/api/v1/logs")
+def api_logs():
+    """Retorna os últimos logs (buffer em memória) para debug visual."""
+    return jsonify({"lines": list(_LOGBUF), "count": len(_LOGBUF)})
 
 @app.get("/")
 def root_tip():
@@ -535,22 +558,22 @@ def root_tip():
         "endpoints": {
             "/api/v1/news": "Snapshot JSON das últimas notícias (com conteúdo via newspaper3k).",
             "/api/v1/status": "Status do snapshot/serviço.",
+            "/api/v1/logs": "Últimos logs (buffer em memória) para debug.",
         }
     }
 
 # ----------------------------- Boot ---------------------------------
 def _start():
+    if not _HAS_NEWSPAPER:
+        _log(f"⚠ newspaper3k indisponível: a coleta resultará em 0 artigos. {_NEWSPAPER_IMPORT_ERR if '_NEWSPAPER_IMPORT_ERR' in globals() else ''}")
     _ensure_first_snapshot()
     if not _refresher_thread.is_alive():
         _refresher_thread.start()
 
 if __name__ == "__main__":
-    import os
-
-    print("🔧 Iniciando API, construindo primeiro snapshot...")
+    _log("🔧 Iniciando API, construindo primeiro snapshot...")
     _start()
-
-    port = int(os.environ.get("PORT", 5000))  # porta que o Render fornece
-    print(f"🚀 API pronta em: 0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
-
+    port = int(os.environ.get("PORT", "5000"))  # Render: define PORT no env
+    host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    _log(f"🚀 API pronta em: {host}:{port}")
+    app.run(host=host, port=port, debug=False, threaded=True)
